@@ -1,337 +1,204 @@
-#Python Dataflow Library
-#Tiago A.O.Alfes <tiago@ime.uerj.br>
-
-from multiprocessing import Process, Queue, Value, Pipe
-import threading
-
-import sys
+from multiprocessing import Process, Queue, Pipe
+from threading import Thread
+from mpi4py import MPI
 
 class Worker(Process):
-	def __init__(self, graph, operand_queue, conn, workerid):
-		Process.__init__(self)		#since we are overriding the superclass's init method
-		#self.taskq = task_queue
-		self.operq = operand_queue
-		self.idle = False
-		self.graph = graph
-		self.wid = workerid
-		self.conn = conn #connection with the scheduler to receive tasks
+    def __init__(self, graph, operand_queue, conn, worker_id):
+        Process.__init__(self)
+        self.oper_queue = operand_queue
+        self.graph = graph
+        self.worker_id = worker_id
+        self.conn = conn
 
-	#def sendops(self, opers):
-		#print "%s sending oper" %self.name
-	#	self.operq.put(opers)	
-	
+    def run(self):
+        self.oper_queue.put(Oper(self.worker_id, None, None, None))  # Request a task to start
 
-
-
-	def run(self):
-		print "I am worker %s" %self.wid
-		self.operq.put([Oper(self.wid, None, None, None)]) #Request a task to start
-
-		while True:
-			#print "Waiting for task %s" %self.name
-			task = self.conn.recv()
-
-			#print "Start working %s" %(self.name)
-			node = self.graph.nodes[task.nodeid]
-			node.run(task.args, self.wid, self.operq)
-			#self.sendops(opermsg)
-			
-		
-
-
+        while True:
+            task = self.conn.recv()
+            node = self.graph.nodes[task.node_id]
+            node.run(task.args, self.worker_id, self.oper_queue)
 
 class Task:
-
-	def __init__(self, f, nodeid, args=None):
-		self.nodeid = nodeid
-		self.args = args
-		
-		
+    def __init__(self, f, node_id, args=None):
+        self.node_id = node_id
+        self.args = args
 
 class DFGraph:
-	def __init__(self):
-		self.nodes = []
-		self.node_count = 0
+    def __init__(self):
+        self.nodes = []
 
-	def add(self, node):
-		node.id = self.node_count
-		self.node_count += 1
-		
-		self.nodes += [node]
-	
+    def add_node(self, node):
+        self.nodes.append(node)
+        node.id = len(self.nodes) - 1
+
 class Node:
-	def __init__(self, f, inputn):
-		self.f = f
-		self.inport = [[] for i in range(inputn)]
-		self.dsts = []
-		self.affinity = None
+    def __init__(self, f, input_count):
+        self.f = f
+        self.in_ports = [[] for _ in range(input_count)]
+        self.dsts = []
+        self.affinity = None
 
-	
-	def add_edge(self, dst, dstport):
-		self.dsts += [(dst.id, dstport)]
+    def add_edge(self, dst, dst_port):
+        self.dsts.append((dst.id, dst_port))
 
+    def pin(self, worker_id):
+        self.affinity = worker_id
 
-	def pin(self, workerid):
-		self.affinity = workerid
+    def run(self, args, worker_id, oper_queue):
+        if len(self.in_ports) == 0:
+            opers = self.create_oper(self.f(), worker_id)
+        else:
+            opers = self.create_oper(self.f([a.val for a in args]), worker_id)
+        self.send_ops(opers, oper_queue)
 
+    def send_ops(self, opers, oper_queue):
+        oper_queue.put(opers)
 
-	def run(self, args, workerid, operq):
-		#print "Running %s" %self
-		if len(self.inport) == 0:
-			opers = self.create_oper(self.f(), workerid, operq)
-		else:
-			opers = self.create_oper(self.f([a.val for a in args]), workerid, operq)
-		self.sendops(opers, operq)
+    def create_oper(self, value, worker_id):
+        opers = []
+        if not self.dsts:
+            opers.append(Oper(worker_id, None, None, None))
+        else:
+            for (dst_id, dst_port) in self.dsts:
+                oper = Oper(worker_id, dst_id, dst_port, value)
+                opers.append(oper)
+        return opers
 
-
-	def sendops(self, opers, operq):
-		operq.put(opers)
-
-	def create_oper(self, value, workerid, operq): #create operand message
-		opers = []
-		if self.dsts == []:
-			opers.append(Oper(workerid, None, None, None)) #if no output is produced by the node, we still have to send a msg to the scheduler.
-		else:
-			for (dstid, dstport) in self.dsts:
-				oper = Oper(workerid, dstid, dstport, value)
-				opers.append(oper)
-				#print "Result produced %s (worker: %d)" %(oper.val, workerid)
-		return opers
-
-
-	def match(self):
-		args = []
-		for port in self.inport:
-			if len(port) > 0:
-				arg = port[0]
-				args += [port[0]]
-		if len(args) == len(self.inport):
-			for inport in self.inport:
-				arg = inport[0]
-				inport.remove(arg)
-			return args
-		else:
-			return None
-
-
+    def match(self):
+        args = []
+        for port in self.in_ports:
+            if port:
+                arg = port[0]
+                args.append(arg)
+                port.remove(arg)
+        if len(args) == len(self.in_ports):
+            return args
+        else:
+            return None
 
 class Oper:
-	def __init__(self, prodid, dstid, dstport, val):
-		self.wid, self.dstid, self.dstport, self.val = prodid, dstid, dstport, val
-		#wid -> id of the worker that produced the oper
-		#dstid -> id of the target task
-		#dstport -> input port of the target task
-		#val -> actual value of the operand
-
-		self.request_task = True #if true, piggybacks a request for a task to the worker where the opers were produced.
-
-
-
-
+    def __init__(self, prod_id, dst_id, dst_port, val):
+        self.worker_id = prod_id
+        self.dst_id = dst_id
+        self.dst_port = dst_port
+        self.val = val
+        self.request_task = True
 
 class Scheduler:
-	TASK_TAG = 0
-	TERMINATE_TAG = 1
-	def __init__(self, graph, n_workers=1, mpi_enabled = True):
-		#self.taskq = Queue()  #queue where the ready tasks are inserted
-		self.operq = Queue()
+    TASK_TAG = 0
+    TERMINATE_TAG = 1
 
-		self.graph = graph
-		self.tasks = []
-		worker_conns = []
-		self.conn = []
-		self.waiting = [] #queue containing idle workers
-		self.n_workers = n_workers #number of workers
-		self.pending_tasks = [0] * n_workers #keeps track of the number of tasks sent to each worker without a request from the worker (due to affinity)
-		for i in range(n_workers):
-			sched_conn, worker_conn = Pipe()
-			worker_conns += [worker_conn]
-			self.conn += [sched_conn]
-		self.workers = [Worker(self.graph, self.operq, worker_conns[i], i) for i in range(n_workers)]
-			
+    def __init__(self, graph, n_workers=1, mpi_enabled=True):
+        self.oper_queue = Queue()
+        self.graph = graph
+        self.tasks = []
+        self.worker_conns = []
+        self.conn = []
+        self.waiting = []
+        self.n_workers = n_workers
 
-		if mpi_enabled:
-			self.mpi_handle()
-		else:
-			self.mpi_rank = None
+        if mpi_enabled:
+            self.mpi_rank = MPI.COMM_WORLD.Get_rank()
+            self.mpi_size = MPI.COMM_WORLD.Get_size()
+            self.n_slaves = self.mpi_size - 1
+        else:
+            self.mpi_rank = None
 
-	def mpi_handle(self):	
-		from mpi4py import MPI
-		comm = MPI.COMM_WORLD
-		rank = comm.Get_rank()
-		self.mpi_size = comm.Get_size()
-		self.mpi_rank = rank
-		self.n_slaves = self.mpi_size - 1
-		self.keep_working = True
-		
-		if rank == 0:
-			print "I am the master. There are %s mpi processes. (hostname = %s)" %(self.mpi_size, MPI.Get_processor_name())
-			self.pending_tasks = [0] * self.n_workers * self.mpi_size
-			self.outqueue = Queue()
-			def mpi_input(inqueue):
-				while self.keep_working:
-					msg = comm.recv(source = MPI.ANY_SOURCE, tag = MPI.ANY_TAG)
-					#print "MPI Received opermsg from slave."
-					inqueue.put(msg)
+    def mpi_handle(self):
+        if self.mpi_rank == 0:
+            self.mpi_master()
+        else:
+            self.mpi_slave()
 
-			def mpi_output(outqueue):
-				while self.keep_working:
-					task = outqueue.get()
-					if task != None: #task == None means termination
-						#print "MPI Sending task to slave node."
-						dest = task.workerid / self.n_workers #destination mpi process
-						comm.send(task, dest = dest, tag = Scheduler.TASK_TAG)
-					else:
+    def mpi_master(self):
+        slaves = []
+        for i in range(1, self.mpi_size):
+            slaves.append(i)
 
-						self.keep_working = False
-						mpi_terminate()
-			def mpi_terminate():
-				print "MPI TERMINATING"
-				for i in xrange(0, self.mpi_size):
-					comm.send(None, dest = i, tag = Scheduler.TERMINATE_TAG)
+        while self.tasks or self.waiting:
+            status = MPI.Status()
+            MPI.COMM_WORLD.recv(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status)
+            slave = status.Get_source()
 
-			t_in = threading.Thread(target = mpi_input, args = (self.operq,))
-			t_out = threading.Thread(target = mpi_output, args = (self.outqueue,))
-		else:
-			print "I am a slave. (hostname = %s)" %MPI.Get_processor_name()
-			#slave
-			self.inqueue = Queue()
-			for worker in self.workers:
-				worker.wid += rank * self.n_workers
+            if len(self.tasks) > 0:
+                task = self.tasks.pop(0)
+                self.conn[slave].send(task)
+            else:
+                self.waiting.append(slave)
 
-			status = MPI.Status()
-			def mpi_input(inqueue):
-				while self.keep_working:
-					task = comm.recv(source = 0, tag = MPI.ANY_TAG, status = status)
-					if status.Get_tag() == Scheduler.TERMINATE_TAG:
-						self.keep_working = False
-						print "MPI received termination."
-						self.terminate_workers(self.workers)	
-					else:
-						#print "MPI Sending task to worker in slave."
-						workerid = task.workerid
-						connid = workerid % self.n_workers
-						self.conn[connid].send(task)
-				self.operq.put(None)
-			def mpi_output(outqueue):
-				while self.keep_working:
-					msg = outqueue.get()
-					if msg != None:
-						#print "MPI send opermsg to master."
-						comm.send(msg, dest = 0, tag = 0)
+        for slave in slaves:
+            self.conn[slave].send(None)
 
-			t_in = threading.Thread(target = mpi_input, args = (self.inqueue,))
-			t_out = threading.Thread(target = mpi_output, args = (self.operq,))
-			
-		threads = [t_in, t_out]
-		self.threads = threads
-		for t in threads:
-			t.start()
+    def mpi_slave(self):
+        worker_id = self.mpi_rank - 1
+        worker = Worker(self.graph, self.oper_queue, self.conn[worker_id], worker_id)
+        worker.start()
 
+        while True:
+            oper = self.oper_queue.get()
+            if oper.request_task:
+                if len(self.waiting) > 0:
+                    self.conn[worker_id].send(self.waiting.pop(0))
+                else:
+                    self.tasks.append(Task(None, None))
+            elif oper.dst_id is None:
+                break
+            else:
+                dst_conn = self.conn[oper.dst_id - 1]
+                dst_conn.send(oper)
 
+    def run(self):
+        if self.n_workers > 1:
+            self.run_multiprocessing()
+        else:
+            self.run_single_thread()
 
+    def run_multiprocessing(self):
+        for _ in range(self.n_workers):
+            parent_conn, child_conn = Pipe()
+            self.worker_conns.append(child_conn)
+            self.conn.append(parent_conn)
 
+        for i, conn in enumerate(self.worker_conns):
+            worker = Worker(self.graph, self.oper_queue, conn, i)
+            worker.start()
 
+        for task in self.tasks:
+            self.worker_conns[task.node_id].send(task)
 
-	def propagate_op(self, oper):
-		dst = self.graph.nodes[oper.dstid]
-		
-		dst.inport[oper.dstport] += [oper]
-		args = dst.match()
-		if args != None:
-			self.issue(dst, args)
-	def check_affinity(self, task):
-		
-		node = self.graph.nodes[task.nodeid]
-		if node.affinity == None:
-			return None
+        for _ in range(self.n_workers):
+            self.oper_queue.get()
 
-		affinity = node.affinity[0]
-		if len(node.affinity) > 1:
-			node.affinity = node.affinity[1:] + [node.affinity[0]]
-		return affinity
+        for conn in self.worker_conns:
+            conn.send(Oper(None, None, None, None))
 
+        for worker in self.worker_conns:
+            worker.join()
 
-	def issue(self, node, args):
-		
-	#	print "Args %s " %args	
-		task = Task(node.f, node.id, args)
-		self.tasks += [task]
+    def run_single_thread(self):
+        worker = Worker(self.graph, self.oper_queue, None, 0)
+        worker.run()
 
-	def all_idle(self, workers):
-		#print [(w.idle, w.name) for w in workers]	
-		#print "All idle? %s" %reduce(lambda a, b: a and b, [w.idle for w in workers])
-		if self.mpi_rank == 0:
-			return len(self.waiting) == self.n_workers * self.mpi_size
-		else:
-			return len(self.waiting) == self.n_workers
+if __name__ == '__main__':
+    graph = DFGraph()
 
+    # Create nodes and add them to the graph
+    node1 = Node(lambda: 1, 0)
+    node2 = Node(lambda: 2, 0)
+    node3 = Node(lambda values: sum(values), 2)
 
-	def terminate_workers(self, workers):
-		print "Terminating workers %s %d %d" %(self.all_idle(self.workers), self.operq.qsize(), len(self.tasks))
-		if self.mpi_rank == 0:
-			self.outqueue.put(None)
-			for t in self.threads:
-				t.join()
-		for worker in workers:
-			worker.terminate()
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
 
-	def start(self):
-		operq = self.operq
+    # Add edges between nodes
+    node1.add_edge(node3, 0)
+    node2.add_edge(node3, 1)
 
-		print "Roots %s" %[r for r in self.graph.nodes if len(r.inport) == 0]
-		for root in [r for r in self.graph.nodes if len(r.inport) == 0]:
-			task = Task(root.f, root.id)
-			self.tasks += [task]
-			
-	
-		for worker in self.workers:
-			print "Starting %s" %worker.wid
-			worker.start()
+    # Set node affinities (optional)
+    node1.pin(0)
+    node2.pin(1)
+    node3.pin(0)
 
-		if self.mpi_rank == 0 or self.mpi_rank == None:
-			#it this is the leader process or if mpi is not being used 
-			print "Main loop"
-			self.main_loop()
-
-	
-	def main_loop(self):
-		tasks = self.tasks
-		operq = self.operq
-		workers = self.workers
-		while len(tasks) > 0 or not self.all_idle(self.workers) or operq.qsize() > 0:
-			opersmsg = operq.get()
-			for oper in opersmsg:
-				if oper.val != None:
-					self.propagate_op(oper)
-
-			wid = opersmsg[0].wid
-			if wid not in self.waiting and opersmsg[0].request_task:
-				if self.pending_tasks[wid] > 0:
-					self.pending_tasks[wid] -= 1
-				else:
-					self.waiting += [wid] #indicate that the worker is idle, waiting for a task
-				
-			while len(tasks) > 0 and len(self.waiting) > 0:
-				task = tasks.pop(0)
-				wid = self.check_affinity(task)
-				if wid != None:
-					if wid in self.waiting:
-						self.waiting.remove(wid)
-					else:
-						self.pending_tasks[wid] += 1
-				else:
-					wid = self.waiting.pop(0)
-				#print "Got opermsg from worker %d" %wid
-				if wid < self.n_workers: #local worker
-					worker = workers[wid]
-					
-					self.conn[worker.wid].send(task)
-				else:
-					task.workerid = wid
-					self.outqueue.put(task)
-			
-		print "Waiting %s" %self.waiting		
-		self.terminate_workers(self.workers)
-		
-		
+    scheduler = Scheduler(graph, n_workers=2)
+    scheduler.run()
